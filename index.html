@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bitcoin Block Counter & Alert</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Use Inter font family -->
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            onAuthStateChanged 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            collection, 
+            addDoc, 
+            onSnapshot, 
+            query, 
+            deleteDoc, 
+            doc,
+            setLogLevel 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Set Firebase logging level
+        setLogLevel('Debug');
+        
+        // --- GLOBAL SETUP ---
+        // Global variables provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        let firebaseConfig = null;
+        if (typeof __firebase_config !== 'undefined') {
+            try {
+                firebaseConfig = JSON.parse(__firebase_config);
+            } catch (e) {
+                console.error("Error parsing firebase config:", e);
+            }
+        } else {
+             // Fallback configuration if running outside the platform environment
+             firebaseConfig = { 
+                apiKey: "YOUR_API_KEY", 
+                authDomain: "YOUR_AUTH_DOMAIN", 
+                projectId: "YOUR_PROJECT_ID", 
+                storageBucket: "YOUR_STORAGE_BUCKET", 
+                messagingSenderId: "YOUR_MESSAGING_SENDER_ID", 
+                appId: "YOUR_APP_ID" 
+             };
+             console.warn("Using placeholder Firebase config. Firestore persistence may fail.");
+        }
+
+        let db;
+        let auth;
+        let userId = 'loading...';
+        let isAuthReady = false;
+
+        // --- CORE APPLICATION STATE & UI ELEMENTS ---
+        let currentBlockHeight = 0;
+        let activeAlerts = {}; // { docId: { targetBlock: number, docId: string } }
+        const UI = {
+            blockNumber: document.getElementById('block-number'),
+            alertList: document.getElementById('alert-list'),
+            alertMessage: document.getElementById('alert-message'),
+            alertInput: document.getElementById('alert-input'),
+            userIdDisplay: document.getElementById('user-id-display'),
+            loadingIndicator: document.getElementById('loading-indicator')
+        };
+        const BLOCKCYPHER_URL = "https://api.blockcypher.com/v1/btc/main";
+        const FETCH_INTERVAL_MS = 60000; // Check every 60 seconds (Bitcoin blocks average 10 min)
+
+        // --- FIREBASE INITIALIZATION & AUTH ---
+
+        // Function to set up Firebase and Authentication
+        async function initializeFirebase() {
+            if (!firebaseConfig || !firebaseConfig.apiKey) {
+                console.error("Firebase config is missing or invalid.");
+                UI.loadingIndicator.textContent = "Error: Firebase configuration missing.";
+                return;
+            }
+            
+            try {
+                const app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+
+                // Authenticate user
+                if (typeof __initial_auth_token !== 'undefined') {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        UI.userIdDisplay.textContent = `User ID: ${userId.substring(0, 8)}...`;
+                        console.log("Authenticated with UID:", userId);
+                        
+                        // Once authenticated, start listening for alerts and block height
+                        subscribeToAlerts();
+                        fetchBlockHeight(true);
+                        setInterval(() => fetchBlockHeight(false), FETCH_INTERVAL_MS);
+                    } else {
+                        console.log("Authentication failed.");
+                        isAuthReady = false;
+                        UI.loadingIndicator.textContent = "Waiting for authentication...";
+                    }
+                });
+            } catch (error) {
+                console.error("Firebase initialization or authentication error:", error);
+                UI.loadingIndicator.textContent = `Auth Error: ${error.message}`;
+            }
+        }
+
+        // --- FIREBASE DATA OPERATIONS ---
+
+        function getAlertsCollectionRef() {
+            if (!db || !userId) return null;
+            // Public data path: /artifacts/{appId}/public/data/alerts
+            const path = `artifacts/${appId}/public/data/alerts`;
+            return collection(db, path);
+        }
+
+        function subscribeToAlerts() {
+            const alertsRef = getAlertsCollectionRef();
+            if (!alertsRef) return;
+
+            const q = query(alertsRef);
+            
+            onSnapshot(q, (snapshot) => {
+                const newAlerts = {};
+                snapshot.forEach(docSnapshot => {
+                    const data = docSnapshot.data();
+                    const targetBlock = parseInt(data.targetBlock);
+                    if (!isNaN(targetBlock)) {
+                         newAlerts[docSnapshot.id] = { 
+                            targetBlock, 
+                            docId: docSnapshot.id,
+                            creatorId: data.creatorId || 'unknown'
+                         };
+                    }
+                });
+                activeAlerts = newAlerts;
+                renderAlerts();
+                checkAlerts(currentBlockHeight); // Check immediately after loading alerts
+            }, (error) => {
+                console.error("Error subscribing to alerts:", error);
+            });
+        }
+
+        async function saveAlert(targetBlock) {
+            if (!isAuthReady || !db) {
+                showMessage('Authentication not ready. Please wait.', 'bg-yellow-500');
+                return;
+            }
+
+            // Simple validation
+            if (isNaN(targetBlock) || targetBlock <= currentBlockHeight) {
+                showMessage('Target block must be a number greater than the current block height.', 'bg-red-500');
+                return;
+            }
+
+            const alertsRef = getAlertsCollectionRef();
+            if (!alertsRef) {
+                showMessage('Error: Firestore connection not ready.', 'bg-red-500');
+                return;
+            }
+
+            try {
+                await addDoc(alertsRef, {
+                    targetBlock: targetBlock,
+                    creatorId: userId,
+                    createdAt: new Date().toISOString()
+                });
+                showMessage(`Alert set for Block #${targetBlock}!`, 'bg-green-500');
+            } catch (e) {
+                console.error("Error adding document: ", e);
+                showMessage(`Failed to save alert: ${e.message}`, 'bg-red-500');
+            }
+            UI.alertInput.value = '';
+        }
+
+        async function deleteAlert(docId) {
+            if (!isAuthReady || !db) return;
+            const alertsRef = getAlertsCollectionRef();
+            try {
+                await deleteDoc(doc(alertsRef, docId));
+                showMessage('Alert removed successfully.', 'bg-gray-500');
+            } catch (e) {
+                console.error("Error deleting document: ", e);
+                showMessage(`Failed to delete alert: ${e.message}`, 'bg-red-500');
+            }
+        }
+
+        // --- BITCOIN API FUNCTION ---
+
+        async function fetchBlockHeight(initialLoad = false) {
+            if (initialLoad) {
+                UI.loadingIndicator.classList.remove('hidden');
+                UI.blockNumber.textContent = '...';
+            }
+
+            try {
+                const response = await fetchWithRetry(BLOCKCYPHER_URL);
+                const data = await response.json();
+                
+                if (data && data.height) {
+                    currentBlockHeight = data.height;
+                    UI.blockNumber.textContent = currentBlockHeight.toLocaleString();
+                    checkAlerts(currentBlockHeight);
+                } else {
+                    console.error("API did not return a valid block height:", data);
+                    showMessage('Error: Could not retrieve block height.', 'bg-red-500');
+                }
+            } catch (error) {
+                console.error("Failed to fetch block height:", error);
+                showMessage(`Failed to fetch block data. Retrying in ${FETCH_INTERVAL_MS / 1000}s.`, 'bg-red-500');
+            } finally {
+                if (initialLoad) {
+                    UI.loadingIndicator.classList.add('hidden');
+                }
+            }
+        }
+        
+        async function fetchWithRetry(url, retries = 3, delay = 1000) {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(url);
+                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                    return response;
+                } catch (error) {
+                    if (i === retries - 1) throw error;
+                    await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
+                }
+            }
+        }
+
+        // --- ALERT LOGIC & UI ---
+        
+        function checkAlerts(currentBlock) {
+            if (currentBlock === 0) return; // Wait for initial fetch
+            let triggeredCount = 0;
+            
+            Object.values(activeAlerts).forEach(alert => {
+                if (currentBlock >= alert.targetBlock) {
+                    triggeredCount++;
+                    // Trigger visual notification
+                    showNotification(`🎉 Block #${alert.targetBlock.toLocaleString()} REACHED!`, alert.docId);
+                    
+                    // Immediately delete the alert from Firestore so it doesn't re-trigger
+                    if (alert.creatorId === userId) {
+                        // Only delete if the current user created it, to avoid deleting others' alerts
+                        // However, since we are using public collection, any user can delete, which is not ideal 
+                        // but acceptable in this simplified, shared data model for a block monitor.
+                        // For simplicity in this public path, we delete it, assuming one user claims it.
+                         deleteAlert(alert.docId);
+                    } else if (alert.creatorId === 'unknown') {
+                         // If creator is unknown, let the first user to catch it delete it.
+                         deleteAlert(alert.docId);
+                    }
+                }
+            });
+
+            if (triggeredCount > 0) {
+                // Refresh the list after deletion attempts
+                renderAlerts();
+            }
+        }
+
+        function showNotification(message, docId) {
+            // Check if this notification is already displayed
+            const existingNotification = document.getElementById(`notif-${docId}`);
+            if (existingNotification) return;
+
+            const notification = document.createElement('div');
+            notification.id = `notif-${docId}`;
+            notification.className = 'p-4 my-2 text-white bg-indigo-600 rounded-lg shadow-lg flex justify-between items-center animate-pulse';
+            notification.innerHTML = `
+                <span>${message}</span>
+                <button onclick="this.parentNode.remove()" class="text-xl font-bold ml-4">
+                    &times;
+                </button>
+            `;
+            UI.alertMessage.appendChild(notification);
+
+            // Auto-hide after 15 seconds
+            setTimeout(() => {
+                if (notification && notification.parentNode) {
+                    notification.parentNode.removeChild(notification);
+                }
+            }, 15000);
+        }
+
+        function showMessage(message, className) {
+            const messageBox = document.getElementById('status-message');
+            messageBox.textContent = message;
+            messageBox.className = `p-3 rounded-lg text-sm text-white transition-all duration-300 ${className}`;
+            messageBox.classList.remove('hidden');
+
+            setTimeout(() => {
+                messageBox.classList.add('hidden');
+            }, 5000);
+        }
+
+        function renderAlerts() {
+            UI.alertList.innerHTML = '';
+            const sortedAlerts = Object.values(activeAlerts).sort((a, b) => a.targetBlock - b.targetBlock);
+            
+            if (sortedAlerts.length === 0) {
+                 UI.alertList.innerHTML = '<p class="text-gray-500 italic p-4 text-center">No active block alerts. Set one above!</p>';
+                 return;
+            }
+
+            sortedAlerts.forEach(alert => {
+                const blockDiff = alert.targetBlock - currentBlockHeight;
+                const isMine = alert.creatorId === userId;
+                
+                const alertItem = document.createElement('div');
+                alertItem.className = 'flex items-center justify-between p-3 mb-2 bg-white rounded-lg shadow transition duration-150 hover:shadow-md';
+                alertItem.innerHTML = `
+                    <div class="flex flex-col">
+                        <span class="text-lg font-semibold text-gray-800">Target Block: 
+                            <span class="text-indigo-600">${alert.targetBlock.toLocaleString()}</span>
+                            ${isMine ? '<span class="text-xs ml-2 px-2 py-0.5 bg-indigo-100 text-indigo-600 rounded-full font-medium">Mine</span>' : ''}
+                        </span>
+                        <span class="text-sm text-gray-500 mt-1">
+                            ${blockDiff > 0 ? `~${blockDiff.toLocaleString()} blocks away` : 'Triggered or Pending Check'}
+                        </span>
+                    </div>
+                    <button 
+                        data-doc-id="${alert.docId}"
+                        class="delete-btn p-2 text-red-600 hover:text-red-800 transition duration-150 rounded-full hover:bg-red-50">
+                        <!-- Icon: Trash -->
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                    </button>
+                `;
+                UI.alertList.appendChild(alertItem);
+            });
+
+            // Attach listeners to delete buttons
+            document.querySelectorAll('.delete-btn').forEach(button => {
+                button.addEventListener('click', (e) => {
+                    const docId = e.currentTarget.getAttribute('data-doc-id');
+                    // In a real app, you'd confirm deletion here.
+                    deleteAlert(docId);
+                });
+            });
+        }
+
+        // --- GLOBAL EVENT LISTENERS ---
+
+        window.onload = function() {
+            // Find UI elements (they are globally available now)
+            initializeFirebase();
+
+            // Set up form submission handler
+            document.getElementById('alert-form').addEventListener('submit', (e) => {
+                e.preventDefault();
+                const targetBlock = parseInt(UI.alertInput.value.trim());
+                saveAlert(targetBlock);
+            });
+        };
+
+        // Export utility functions for inline event handlers
+        window.deleteAlert = deleteAlert;
+    </script>
+</head>
+
+<body class="bg-gray-50 min-h-screen p-4 md:p-8">
+
+    <div class="max-w-4xl mx-auto">
+        <header class="text-center mb-8">
+            <h1 class="text-4xl font-extrabold text-gray-900 mb-2 flex items-center justify-center">
+                <svg class="w-8 h-8 mr-3 text-yellow-500" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm-1-8a1 1 0 011-1h2a1 1 0 110 2h-2a1 1 0 01-1-1zM9 9a1 1 0 000 2h2a1 1 0 100-2H9z" clip-rule="evenodd"></path>
+                    <path d="M10 3a1 1 0 00-1 1v1a1 1 0 102 0V4a1 1 0 00-1-1zM4 10a1 1 0 011-1h1a1 1 0 110 2H5a1 1 0 01-1-1zM15 9a1 1 0 00-1 1h-1a1 1 0 100 2h1a1 1 0 100-2zM10 16a1 1 0 01-1 1v1a1 1 0 102 0v-1a1 1 0 01-1-1zM17 10a1 1 0 00-1 1v1a1 1 0 102 0v-1a1 1 0 00-1-1zM3 10a1 1 0 011-1h1a1 1 0 110 2H4a1 1 0 01-1-1z" clip-rule="evenodd"></path>
+                </svg>
+                Bitcoin Block Monitor
+            </h1>
+            <p id="user-id-display" class="text-xs text-gray-400">User ID: Initializing...</p>
+        </header>
+        
+        <!-- Current Block Display Card -->
+        <div class="bg-white p-6 rounded-xl shadow-2xl mb-8 text-center border-b-4 border-indigo-500">
+            <p class="text-xl font-medium text-gray-500 mb-3">Current Block Height</p>
+            <div id="loading-indicator" class="text-gray-400 text-lg hidden">Fetching live data...</div>
+            <p id="block-number" class="text-7xl font-mono font-extrabold text-indigo-700">
+                0
+            </p>
+            <p class="text-sm text-gray-400 mt-2">Updating approximately every minute.</p>
+        </div>
+
+        <!-- Notification Area -->
+        <div id="alert-message" class="fixed top-4 right-4 z-50 max-w-sm w-full">
+            <!-- Alert notifications will appear here -->
+        </div>
+        
+        <!-- Status Message Area -->
+        <div id="status-message" class="hidden p-3 rounded-lg text-sm text-white text-center mb-4 transition-all duration-300"></div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            
+            <!-- Alert Setting Form -->
+            <div class="bg-white p-6 rounded-xl shadow-lg border-t-4 border-yellow-500 h-fit">
+                <h2 class="text-2xl font-bold text-gray-800 mb-4">Set a New Block Alert</h2>
+                <p class="text-gray-600 mb-4">Receive a notification when the block height reaches your target number.</p>
+                
+                <form id="alert-form" class="flex flex-col space-y-4">
+                    <label for="alert-input" class="text-sm font-medium text-gray-700">Target Block Number (e.g., a Halving block)</label>
+                    <input 
+                        type="number" 
+                        id="alert-input" 
+                        placeholder="Enter target block number" 
+                        min="1"
+                        required 
+                        class="p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 text-lg font-mono transition duration-150"
+                    >
+                    <button 
+                        type="submit" 
+                        class="w-full py-3 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 focus:outline-none focus:ring-4 focus:ring-indigo-500 focus:ring-opacity-50 transition duration-150 transform hover:scale-[1.01] active:scale-[0.99]"
+                    >
+                        Set Alert
+                    </button>
+                </form>
+            </div>
+
+            <!-- Active Alerts List -->
+            <div class="bg-gray-100 p-6 rounded-xl shadow-lg border-t-4 border-green-500">
+                <h2 class="text-2xl font-bold text-gray-800 mb-4">Active Alerts (Public)</h2>
+                <div id="alert-list" class="space-y-3">
+                    <p class="text-gray-500 italic text-center">Loading alerts...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
