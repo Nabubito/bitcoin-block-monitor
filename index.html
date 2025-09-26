@@ -6,8 +6,6 @@
     <title>Bitcoin Block Monitor & Alert</title>
     <!-- Load Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Load Lucide Icons for React - not used in HTML, but keeping for reference if this was React -->
-    <!-- We will use inline SVGs for the icons -->
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
         body {
@@ -117,11 +115,25 @@
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, doc, addDoc, deleteDoc, onSnapshot, collection, query, where, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
+        // =========================================================================
+        // YOUR FIREBASE CONFIGURATION (FOR GITHUB PAGES HOSTING)
+        // This configuration enables persistent, real-time alerts.
+        // =========================================================================
+        const USER_FIREBASE_CONFIG = {
+            apiKey: "AIzaSyCZH55OpWRTDAY5Evrw-JCSU-6PzGxkf7M",
+            authDomain: "bitcoin-block-monitor.firebaseapp.com",
+            projectId: "bitcoin-block-monitor",
+            storageBucket: "bitcoin-block-monitor.firebasestorage.app",
+            messagingSenderId: "1087702166491",
+            appId: "1:1087702166491:web:4fa70d4be639446bef15fe",
+            measurementId: "G-MNRVM0VN02"
+        };
+        
         // Global state for application
         let currentBlockHeight = 0;
         let db, auth, userId;
         let isFirebaseReady = false;
-        let appId; // ADDED: Declared appId in the module scope
+        let appId;
         
         // --- DOM Elements ---
         const blockHeightDisplay = document.getElementById('current-block-height');
@@ -141,14 +153,12 @@
          */
         async function fetchBlockHeight() {
             try {
-                // CHANGED API ENDPOINT to Blockstream for reliability on static hosts
                 const response = await fetch('https://blockstream.info/api/blocks/tip/height');
                 
                 if (!response.ok) {
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
                 
-                // Blockstream returns the height as a plain text string
                 const dataText = await response.text();
                 const newBlockHeight = parseInt(dataText.trim(), 10);
 
@@ -157,18 +167,15 @@
                 }
 
                 if (newBlockHeight !== currentBlockHeight) {
-                    // Update display
                     blockHeightDisplay.textContent = newBlockHeight.toLocaleString();
-                    blockHeightDisplay.classList.remove('animate-pulse'); // Stop pulsing once data loads
+                    blockHeightDisplay.classList.remove('animate-pulse');
                     
-                    // Check alerts if block height has changed
                     if (currentBlockHeight !== 0) {
                         checkAlerts(newBlockHeight);
                     }
                     currentBlockHeight = newBlockHeight;
                 }
 
-                // Update status display
                 lastUpdatedDisplay.textContent = new Date().toLocaleTimeString();
 
             } catch (error) {
@@ -215,6 +222,7 @@
          * @param {string} currentUserId Current authenticated user ID.
          */
         function setupFirestoreListeners(firestoreDb, currentUserId) {
+            // Note: Uses the global 'appId' variable
             const alertsRef = collection(firestoreDb, 'artifacts', appId, 'users', currentUserId, 'alerts');
             const q = query(alertsRef);
             
@@ -262,7 +270,7 @@
                 await addDoc(alertsRef, {
                     targetBlock: targetBlock,
                     createdAt: Date.now(),
-                    target: targetBlock // Redundant, but good for querying
+                    target: targetBlock
                 });
                 alertInput.value = '';
                 alertMessage.textContent = `Alert set for block ${targetBlock.toLocaleString()}.`;
@@ -301,8 +309,6 @@
          * @param {string} docId The Firestore document ID.
          */
         function renderAlert(targetBlock, docId) {
-            // Note: The original 'percentComplete' calculation was overly complex and not used for display. 
-            // Keeping the function simple for now as progress display is not implemented.
             
             const alertItem = document.createElement('div');
             alertItem.className = 'alert-item flex items-center justify-between p-3 rounded-lg bg-gray-700 border border-gray-600 shadow-md transition-all duration-300';
@@ -329,18 +335,26 @@
 
         /**
          * Initialize Firebase, set up authentication, and listeners.
-         * This block is designed to be robust on GitHub Pages.
          */
         function initializeFirebaseAndApp() {
-            // Check for required global variables which are only present in the Canvas environment
-            const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
-            const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-            // FIXED: Assign to the module-level 'appId' variable declared above.
-            appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'; 
+            // Priority 1: Use config from the running canvas environment (if present)
+            let finalConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+            
+            // Priority 2: Use the user's manually provided config (if filled out)
+            if (!finalConfig && USER_FIREBASE_CONFIG && USER_FIREBASE_CONFIG.projectId) {
+                finalConfig = USER_FIREBASE_CONFIG;
+                appId = finalConfig.projectId; // Use projectId as a simple appId when external
+            }
 
-            if (firebaseConfig) {
+            const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+            
+            // Set appId based on environment
+            appId = typeof __app_id !== 'undefined' ? __app_id : finalConfig?.projectId || 'default-app-id';
+
+
+            if (finalConfig) {
                 try {
-                    const app = initializeApp(firebaseConfig);
+                    const app = initializeApp(finalConfig);
                     db = getFirestore(app);
                     auth = getAuth(app);
                     isFirebaseReady = true;
@@ -358,6 +372,7 @@
                             if (initialAuthToken) {
                                 await signInWithCustomToken(auth, initialAuthToken);
                             } else {
+                                // Sign in anonymously for persistent user storage (if they return later)
                                 await signInAnonymously(auth);
                             }
                         }
@@ -367,17 +382,18 @@
 
                 } catch (e) {
                     console.error("Firebase Initialization Error:", e);
-                    firebaseStatus.innerHTML = '<span class="text-red-500">Firebase Error. Alerts disabled.</span>';
+                    firebaseStatus.innerHTML = '<span class="text-red-500">Firebase Error. Alerts disabled. Check console for config error.</span>';
                 }
             } else {
-                // If no firebase config is available (running on GitHub Pages)
+                // If no firebase config is available (running on GitHub Pages without config)
                 console.warn("Firebase config missing. Running in Blockstream-only mode. Alerts will NOT be saved or synced.");
                 firebaseStatus.innerHTML = '<span class="text-yellow-400 font-semibold">Alerts Not Saved (Offline/Local Mode)</span>';
                 document.getElementById('user-id').textContent = 'User ID: N/A (Offline)';
-                setAlertButton.disabled = true;
-                setAlertButton.textContent = 'Alerts Disabled';
-                setAlertButton.classList.remove('button-primary');
-                setAlertButton.classList.add('bg-gray-500');
+                setAlertButton.disabled = false; // Enable for local mock functionality
+                setAlertButton.textContent = 'Set Local Alert';
+                setAlertButton.classList.remove('bg-gray-500');
+                setAlertButton.classList.add('button-primary');
+
 
                 // Provide a non-persistent alert mechanism for offline mode
                 setAlertButton.onclick = () => {
