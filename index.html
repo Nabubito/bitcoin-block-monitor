@@ -94,7 +94,7 @@
         <!-- Footer / Debug Info -->
         <div class="text-center pt-4 border-t border-gray-700 text-xs text-gray-500 space-y-1">
             <p id="user-id">User ID: N/A (Offline Mode)</p>
-            <p>Data provided by BlockCypher API (Polled every 15 seconds)</p>
+            <p>Data provided by Blockstream API (Polled every 15 seconds)</p>
         </div>
 
         <!-- Custom Modal for Alert Trigger -->
@@ -121,6 +121,7 @@
         let currentBlockHeight = 0;
         let db, auth, userId;
         let isFirebaseReady = false;
+        let appId; // ADDED: Declared appId in the module scope
         
         // --- DOM Elements ---
         const blockHeightDisplay = document.getElementById('current-block-height');
@@ -136,17 +137,24 @@
         // --- Core Application Functions ---
 
         /**
-         * Fetches the current Bitcoin block height from BlockCypher.
+         * Fetches the current Bitcoin block height from the Blockstream API.
          */
         async function fetchBlockHeight() {
             try {
-                const response = await fetch('https://api.blockcypher.com/v1/btc/main');
+                // CHANGED API ENDPOINT to Blockstream for reliability on static hosts
+                const response = await fetch('https://blockstream.info/api/blocks/tip/height');
+                
                 if (!response.ok) {
                     throw new Error(`HTTP error! status: ${response.status}`);
                 }
-                const data = await response.json();
                 
-                const newBlockHeight = data.height;
+                // Blockstream returns the height as a plain text string
+                const dataText = await response.text();
+                const newBlockHeight = parseInt(dataText.trim(), 10);
+
+                if (isNaN(newBlockHeight)) {
+                     throw new Error("Invalid response from API (not a number).");
+                }
 
                 if (newBlockHeight !== currentBlockHeight) {
                     // Update display
@@ -293,8 +301,9 @@
          * @param {string} docId The Firestore document ID.
          */
         function renderAlert(targetBlock, docId) {
-            const percentComplete = Math.min(100, ((currentBlockHeight - (currentBlockHeight * 0.9)) / (targetBlock - (currentBlockHeight * 0.9))) * 100);
-
+            // Note: The original 'percentComplete' calculation was overly complex and not used for display. 
+            // Keeping the function simple for now as progress display is not implemented.
+            
             const alertItem = document.createElement('div');
             alertItem.className = 'alert-item flex items-center justify-between p-3 rounded-lg bg-gray-700 border border-gray-600 shadow-md transition-all duration-300';
             alertItem.dataset.target = targetBlock;
@@ -326,7 +335,8 @@
             // Check for required global variables which are only present in the Canvas environment
             const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
             const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            // FIXED: Assign to the module-level 'appId' variable declared above.
+            appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'; 
 
             if (firebaseConfig) {
                 try {
@@ -361,7 +371,7 @@
                 }
             } else {
                 // If no firebase config is available (running on GitHub Pages)
-                console.warn("Firebase config missing. Running in BlockCypher-only mode. Alerts will NOT be saved or synced.");
+                console.warn("Firebase config missing. Running in Blockstream-only mode. Alerts will NOT be saved or synced.");
                 firebaseStatus.innerHTML = '<span class="text-yellow-400 font-semibold">Alerts Not Saved (Offline/Local Mode)</span>';
                 document.getElementById('user-id').textContent = 'User ID: N/A (Offline)';
                 setAlertButton.disabled = true;
